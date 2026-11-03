@@ -1,0 +1,21 @@
+{
+  "name": "archivo-cmds-backend",
+  "version": "1.0.0",
+  "description": "Backend API para Sistema de Gestión de Archivo y Expedientes CMDS",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["archivo", "expedientes", "cmds"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mssql": "^12.7.0",
+    "xlsx": "^0.18.5"
+  }
+}
