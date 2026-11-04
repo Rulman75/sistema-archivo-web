@@ -5,7 +5,7 @@ require('dotenv').config();
 // Convertir INT8 / BIGINT (ej. COUNT(*) en PostgreSQL) a Number de JS igual que mssql
 pgTypes.setTypeParser(20, val => (val === null ? null : parseInt(val, 10)));
 
-const DB_ENGINE = (process.env.DB_ENGINE || 'mssql').toLowerCase();
+const DB_ENGINE = (process.env.DB_ENGINE || 'dual').toLowerCase();
 
 // ============================================================================
 // TRADUCTOR Y ADAPTADOR HÍBRIDO SQL SERVER <-> POSTGRESQL

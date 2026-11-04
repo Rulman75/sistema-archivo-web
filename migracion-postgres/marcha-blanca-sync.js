@@ -448,15 +448,172 @@ async function syncBidireccionalArchivo(msPool, pgPool) {
     return { cambiosSqlAPg, cambiosPgASql };
 }
 
+// ============================================================================
+// 2. SINCRONIZACIÓN BIDIRECCIONAL: SISTEMA TRASPASO SLEP (TraspasoSlep <-> bd_traspaso_slep)
+// ============================================================================
+
+function stateWeightSlep(st) {
+    const s = clean(st).toUpperCase();
+    if (!s || s === 'PENDIENTE') return 0;
+    if (s === 'APROBADO FUNCIONARIO' || s === 'RECHAZADO FUNCIONARIO') return 1;
+    if (s === 'PENDIENTE BIENIO' || s === 'APROBADO CMDS' || s === 'RECHAZADO CMDS') return 2;
+    return 1;
+}
+
+async function syncBidireccionalTraspasoSlep(msPoolSlep, pgPoolSlep) {
+    let cambiosSqlAPg = 0;
+    let cambiosPgASql = 0;
+
+    // A. Sincronizar estado de validación, reclamos y contraseñas en PERSONAL (activos codigo='1')
+    const [msPersRes, pgPersRes] = await Promise.all([
+        msPoolSlep.request().query(`
+            SELECT LTRIM(RTRIM([RUT EMPLEADO])) AS rut,
+                   ISNULL(estado_validacion, 'PENDIENTE') AS estado_validacion,
+                   fecha_reclamo,
+                   ISNULL(CONVERT(VARCHAR(19), fecha_reclamo, 120), '') AS fecha_reclamo_str,
+                   ruta_evidencia,
+                   rechazo_motivo,
+                   observaciones,
+                   observacion_cmds,
+                   email,
+                   celular,
+                   password,
+                   CAST(ISNULL(password_changed, 0) AS INT) AS password_changed
+            FROM dbo.PERSONAL
+            WHERE codigo = '1' AND [RUT EMPLEADO] IS NOT NULL
+        `),
+        pgPoolSlep.query(`
+            SELECT TRIM("rut empleado") AS rut,
+                   COALESCE(estado_validacion, 'PENDIENTE') AS estado_validacion,
+                   fecha_reclamo,
+                   COALESCE(TO_CHAR(fecha_reclamo, 'YYYY-MM-DD HH24:MI:SS'), '') AS fecha_reclamo_str,
+                   ruta_evidencia,
+                   rechazo_motivo,
+                   observaciones,
+                   observacion_cmds,
+                   email,
+                   celular,
+                   password,
+                   CASE WHEN password_changed = TRUE THEN 1 ELSE 0 END AS password_changed
+            FROM personal
+            WHERE codigo = '1' AND "rut empleado" IS NOT NULL
+        `)
+    ]);
+
+    const msMap = new Map(msPersRes.recordset.map(r => [clean(r.rut), r]));
+    const pgMap = new Map(pgPersRes.rows.map(r => [clean(r.rut), r]));
+
+    for (const [rut, msRow] of msMap.entries()) {
+        const pgRow = pgMap.get(rut);
+        if (!pgRow) continue;
+
+        const wMs = stateWeightSlep(msRow.estado_validacion);
+        const wPg = stateWeightSlep(pgRow.estado_validacion);
+
+        const diffEstado = clean(msRow.estado_validacion) !== clean(pgRow.estado_validacion);
+        const diffObsCmds = clean(msRow.observacion_cmds) !== clean(pgRow.observacion_cmds);
+        const diffObsFunc = clean(msRow.observaciones) !== clean(pgRow.observaciones);
+        const diffPass = clean(msRow.password) !== clean(pgRow.password);
+
+        if (!diffEstado && !diffObsCmds && !diffObsFunc && !diffPass) continue;
+
+        // Comparar fecha_reclamo_str en formato ISO 'YYYY-MM-DD HH:MI:SS' sin desfase de zona horaria
+        const tMs = clean(msRow.fecha_reclamo_str);
+        const tPg = clean(pgRow.fecha_reclamo_str);
+
+        const pgExplicitlyNewer =
+            wPg > wMs ||
+            (wPg === wMs && tPg > tMs) ||
+            (wPg === wMs && tPg === tMs && Number(pgRow.password_changed) > Number(msRow.password_changed)) ||
+            (wPg === wMs && tPg === tMs && clean(pgRow.observacion_cmds).length > clean(msRow.observacion_cmds).length);
+
+        const msWins = !pgExplicitlyNewer;
+
+        if (msWins) {
+            await pgPoolSlep.query(
+                `UPDATE personal
+                 SET estado_validacion = $1,
+                     fecha_reclamo = $2,
+                     ruta_evidencia = $3,
+                     rechazo_motivo = $4,
+                     observaciones = $5,
+                     observacion_cmds = $6,
+                     email = $7,
+                     celular = $8,
+                     password = $9,
+                     password_changed = $10
+                 WHERE TRIM("rut empleado") = $11 AND codigo = '1'`,
+                [
+                    msRow.estado_validacion,
+                    msRow.fecha_reclamo || null,
+                    msRow.ruta_evidencia || null,
+                    msRow.rechazo_motivo || null,
+                    msRow.observaciones || null,
+                    msRow.observacion_cmds || null,
+                    msRow.email || null,
+                    msRow.celular || null,
+                    msRow.password || null,
+                    Boolean(msRow.password_changed),
+                    rut
+                ]
+            );
+            cambiosSqlAPg++;
+        } else {
+            await msPoolSlep
+                .request()
+                .input('estado', sql.VarChar, pgRow.estado_validacion)
+                .input('fecha', sql.DateTime, pgRow.fecha_reclamo || null)
+                .input('evid', sql.VarChar, pgRow.ruta_evidencia || null)
+                .input('motivo', sql.VarChar, pgRow.rechazo_motivo || null)
+                .input('obs', sql.VarChar, pgRow.observaciones || null)
+                .input('obsCmds', sql.VarChar, pgRow.observacion_cmds || null)
+                .input('email', sql.VarChar, pgRow.email || null)
+                .input('celular', sql.VarChar, pgRow.celular || null)
+                .input('pass', sql.VarChar, pgRow.password || null)
+                .input('passChg', sql.Bit, Boolean(pgRow.password_changed))
+                .input('rut', sql.VarChar, rut)
+                .query(`
+                    UPDATE dbo.PERSONAL
+                    SET estado_validacion = @estado,
+                        fecha_reclamo = @fecha,
+                        ruta_evidencia = @evid,
+                        rechazo_motivo = @motivo,
+                        observaciones = @obs,
+                        observacion_cmds = @obsCmds,
+                        email = @email,
+                        celular = @celular,
+                        password = @pass,
+                        password_changed = @passChg
+                    WHERE LTRIM(RTRIM([RUT EMPLEADO])) = @rut AND codigo = '1'
+                `);
+            cambiosPgASql++;
+        }
+    }
+
+    return { cambiosSqlAPg, cambiosPgASql };
+}
+
 async function runCycle() {
     let msPool251;
+    let msPoolSlep;
     let pgPoolArchivo;
+    let pgPoolSlep;
     try {
         msPool251 = await new sql.ConnectionPool({
             user: process.env.SQL251_USER || 'sa',
             password: process.env.SQL251_PASS || 'Total2014',
             server: process.env.SQL251_HOST || '192.168.3.251',
             database: 'Archivo',
+            requestTimeout: 60000,
+            connectionTimeout: 15000,
+            options: { encrypt: false, trustServerCertificate: true }
+        }).connect();
+
+        msPoolSlep = await new sql.ConnectionPool({
+            user: process.env.SQL251_USER || 'sa',
+            password: process.env.SQL251_PASS || 'Total2014',
+            server: process.env.SQL251_HOST || '192.168.3.251',
+            database: 'TraspasoSlep',
             requestTimeout: 60000,
             connectionTimeout: 15000,
             options: { encrypt: false, trustServerCertificate: true }
@@ -471,18 +628,34 @@ async function runCycle() {
             max: 5
         });
 
-        const { cambiosSqlAPg, cambiosPgASql } = await syncBidireccionalArchivo(msPool251, pgPoolArchivo);
+        pgPoolSlep = new PgPool({
+            host: PG_HOST,
+            port: PG_PORT,
+            user: PG_USER,
+            password: PG_PASS,
+            database: 'bd_traspaso_slep',
+            max: 5
+        });
+
+        const resArch = await syncBidireccionalArchivo(msPool251, pgPoolArchivo);
+        const resSlep = await syncBidireccionalTraspasoSlep(msPoolSlep, pgPoolSlep);
+
+        const totalSqlAPg = resArch.cambiosSqlAPg + resSlep.cambiosSqlAPg;
+        const totalPgASql = resArch.cambiosPgASql + resSlep.cambiosPgASql;
+
         const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
-        if (cambiosSqlAPg > 0 || cambiosPgASql > 0 || RUN_ONCE) {
+        if (totalSqlAPg > 0 || totalPgASql > 0 || RUN_ONCE) {
             console.log(
-                `[${stamp}] Sincronización Marcha Blanca OK -> SQL->PG: ${cambiosSqlAPg} cambios | PG->SQL: ${cambiosPgASql} cambios`
+                `[${stamp}] Sincronización Marcha Blanca OK -> Archivo(SQL->PG:${resArch.cambiosSqlAPg}, PG->SQL:${resArch.cambiosPgASql}) | TraspasoSLEP(SQL->PG:${resSlep.cambiosSqlAPg}, PG->SQL:${resSlep.cambiosPgASql})`
             );
         }
     } catch (err) {
         console.error(`[${new Date().toISOString()}] Error en ciclo Marcha Blanca:`, err.message);
     } finally {
         if (msPool251) await msPool251.close().catch(() => {});
+        if (msPoolSlep) await msPoolSlep.close().catch(() => {});
         if (pgPoolArchivo) await pgPoolArchivo.end().catch(() => {});
+        if (pgPoolSlep) await pgPoolSlep.end().catch(() => {});
     }
 }
 
