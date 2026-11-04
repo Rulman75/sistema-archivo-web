@@ -11,14 +11,14 @@ function getGitInfo() {
   let tagVersion = pkg.version
   let date = new Date().toISOString().split('T')[0]
   try {
-    commit = execSync('git rev-parse --short HEAD').toString().trim()
+    commit = execSync('git rev-parse --short HEAD', { stdio: ['pipe', 'pipe', 'ignore'] }).toString().trim()
   } catch {}
   try {
-    const rawDate = execSync('git log -1 --format=%cd --date=short').toString().trim()
+    const rawDate = execSync('git log -1 --format=%cd --date=short', { stdio: ['pipe', 'pipe', 'ignore'] }).toString().trim()
     if (rawDate) date = rawDate
   } catch {}
   try {
-    const latestTag = execSync('git describe --tags --abbrev=0').toString().trim()
+    const latestTag = execSync('git describe --tags --abbrev=0', { stdio: ['pipe', 'pipe', 'ignore'] }).toString().trim()
     if (latestTag) {
       const cleanTag = latestTag.replace(/^v/i, '')
       if (cleanTag && pkg.version === '0.0.0') tagVersion = cleanTag

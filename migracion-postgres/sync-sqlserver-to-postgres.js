@@ -94,18 +94,18 @@ const CATALOGO_BASES = [
     { etapa: 2, sourceServer: '159', sourceDb: 'Encuestas', targetDb: 'bd_encuestas', descripcion: 'Sistema de Encuestas' },
     { etapa: 2, sourceServer: '251', sourceDb: 'Rem', targetDb: 'bd_rem', descripcion: 'Base de Remuneraciones' },
 
-    // --- ETAPA 3: HISTÓRICOS Y RESPALDO ---
-    { etapa: 3, sourceServer: '251', sourceDb: 'ControlHorario', targetDb: 'bd_control_horario', descripcion: 'Histórico Control Horario' },
-    { etapa: 3, sourceServer: '251', sourceDb: 'Asistencia2', targetDb: 'bd_asistencia2', descripcion: 'Reloj Control / Asistencia' },
-    { etapa: 3, sourceServer: '251', sourceDb: 'CMDS2014', targetDb: 'bd_cmds2014', descripcion: 'Histórico ERP Softland CMDS2014' },
-    { etapa: 3, sourceServer: '251', sourceDb: 'DESOAN1', targetDb: 'bd_desoan1', descripcion: 'Histórico ERP Softland DESOAN1' },
-    { etapa: 3, sourceServer: '159', sourceDb: 'CORPORACION_2016', targetDb: 'bd_corporacion_2016', descripcion: 'Histórico Corporación 2016' },
+    // --- ETAPA 3: HISTÓRICOS Y RESPALDO (Ordenados de más livianos a más pesados) ---
     { etapa: 3, sourceServer: '251', sourceDb: 'Farmacia', targetDb: 'bd_farmacia', descripcion: 'Histórico Farmacia' },
     { etapa: 3, sourceServer: '251', sourceDb: 'MERMAS_APS', targetDb: 'bd_mermas_aps', descripcion: 'Mermas APS' },
     { etapa: 3, sourceServer: '251', sourceDb: 'GastosConvenios', targetDb: 'bd_gastos_convenios', descripcion: 'Gastos Convenios' },
     { etapa: 3, sourceServer: '251', sourceDb: 'RRHH_APS', targetDb: 'bd_rrhh_aps', descripcion: 'RRHH APS' },
     { etapa: 3, sourceServer: '251', sourceDb: 'Cheques', targetDb: 'bd_cheques', descripcion: 'Registro de Cheques' },
-    { etapa: 3, sourceServer: '251', sourceDb: 'Varios', targetDb: 'bd_varios', descripcion: 'Varios' }
+    { etapa: 3, sourceServer: '251', sourceDb: 'Varios', targetDb: 'bd_varios', descripcion: 'Varios' },
+    { etapa: 3, sourceServer: '159', sourceDb: 'CORPORACION_2016', targetDb: 'bd_corporacion_2016', descripcion: 'Histórico Corporación 2016' },
+    { etapa: 3, sourceServer: '251', sourceDb: 'Asistencia2', targetDb: 'bd_asistencia2', descripcion: 'Reloj Control / Asistencia' },
+    { etapa: 3, sourceServer: '251', sourceDb: 'DESOAN1', targetDb: 'bd_desoan1', descripcion: 'Histórico ERP Softland DESOAN1' },
+    { etapa: 3, sourceServer: '251', sourceDb: 'CMDS2014', targetDb: 'bd_cmds2014', descripcion: 'Histórico ERP Softland CMDS2014' },
+    { etapa: 3, sourceServer: '251', sourceDb: 'ControlHorario', targetDb: 'bd_control_horario', descripcion: 'Histórico Control Horario' }
 ];
 
 function getSqlServerConfig(serverKey, dbName) {
@@ -115,7 +115,7 @@ function getSqlServerConfig(serverKey, dbName) {
             password: process.env.SQL159_PASS || 'base2014',
             server: process.env.SQL159_HOST || '192.168.3.159',
             database: dbName,
-            requestTimeout: 120000,
+            requestTimeout: 900000,
             connectionTimeout: 30000,
             options: {
                 encrypt: false,
@@ -129,7 +129,7 @@ function getSqlServerConfig(serverKey, dbName) {
         password: process.env.SQL251_PASS || 'Total2014',
         server: process.env.SQL251_HOST || '192.168.3.251',
         database: dbName,
-        requestTimeout: 120000,
+        requestTimeout: 900000,
         connectionTimeout: 30000,
         options: {
             encrypt: false,
@@ -447,43 +447,51 @@ async function sincronizarBaseEnVivoPostgres(dbEntry, pgConfig) {
     const client = await pgPool.connect();
 
     try {
-        for (const t of tables) {
-            await client.query(buildCreateTableDDL(t));
+        const populatedPgTables = new Set();
 
+        for (const t of tables) {
             const validCols = t.columns.filter(c => String(c.DATA_TYPE).toLowerCase() !== 'timestamp');
             if (validCols.length === 0) continue;
 
-            const sqlColList = validCols.map(c => `[${c.COLUMN_NAME}]`).join(', ');
-            const pgColList = validCols.map(c => pgIdent(c.pgColName)).join(', ');
-
             const countRes = await sqlPool.request().query(
-                `SELECT COUNT(*) AS total FROM [${t.schema}].[${t.tableName}]`
+                `SELECT COUNT(*) AS total FROM [${t.schema}].[${t.tableName}] WITH (NOLOCK)`
             );
             const totalRows = countRes.recordset[0].total;
+
+            // Si ya se migró una tabla homónima de otro esquema (ej. softland vs dbo) con datos y ésta está vacía, no pisarla
+            if (totalRows === 0 && populatedPgTables.has(t.pgTableName)) {
+                continue;
+            }
+
+            // Verificar si la tabla ya existe en PostgreSQL con el conteo exacto 1:1 (permite reanudar sin repetir tablas gigantes)
+            if (totalRows > 0) {
+                try {
+                    const existingRes = await client.query(`SELECT COUNT(*)::int AS c FROM ${pgIdent(t.pgTableName)}`);
+                    if (existingRes.rows[0].c === totalRows) {
+                        populatedPgTables.add(t.pgTableName);
+                        console.log(`  ✔ CUADRATURA 1:1 OK (ya sincronizada) | ${t.tableName}: SQL Server=${totalRows.toLocaleString('es-CL')} | Postgres=${totalRows.toLocaleString('es-CL')}`);
+                        continue;
+                    }
+                } catch {
+                    // La tabla no existe aún en PostgreSQL
+                }
+            }
+
+            await client.query(buildCreateTableDDL(t));
+
+            const sqlColList = validCols.map(c => `[${c.COLUMN_NAME}]`).join(', ');
+            const pgColList = validCols.map(c => pgIdent(c.pgColName)).join(', ');
 
             if (totalRows === 0) {
                 console.log(`  - ${t.tableName}: 0 filas`);
                 continue;
             }
+            populatedPgTables.add(t.pgTableName);
 
-            const BATCH_SIZE = 1000;
+            const SUB_BATCH = Math.max(1, Math.min(400, Math.floor(60000 / validCols.length)));
             let insertedTotal = 0;
 
-            for (let offset = 0; offset < totalRows; offset += BATCH_SIZE) {
-                const batchRes = await sqlPool.request().query(`
-                    SELECT ${sqlColList}
-                    FROM (
-                        SELECT ${sqlColList}, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS __rn
-                        FROM [${t.schema}].[${t.tableName}]
-                    ) __t
-                    WHERE __t.__rn > ${offset} AND __t.__rn <= ${offset + BATCH_SIZE}
-                `);
-
-                const rows = batchRes.recordset;
-                if (rows.length === 0) break;
-
-                // Insertar en sub-bloques parametrizados seguros
-                const SUB_BATCH = 200;
+            const flushChunk = async (rows) => {
                 for (let i = 0; i < rows.length; i += SUB_BATCH) {
                     const chunk = rows.slice(i, i + SUB_BATCH);
                     const values = [];
@@ -505,7 +513,48 @@ async function sincronizarBaseEnVivoPostgres(dbEntry, pgConfig) {
                     );
                     insertedTotal += chunk.length;
                 }
-            }
+            };
+
+            // Streaming lineal O(N) directo desde SQL Server (evita escaneos cuadráticos en tablas de >10 millones de filas)
+            await new Promise((resolve, reject) => {
+                const streamReq = sqlPool.request();
+                streamReq.stream = true;
+                let buffer = [];
+                let lastLogged = 0;
+
+                streamReq.on('row', row => {
+                    buffer.push(row);
+                    if (buffer.length >= 2000) {
+                        streamReq.pause();
+                        const toInsert = buffer;
+                        buffer = [];
+                        flushChunk(toInsert)
+                            .then(() => {
+                                if (totalRows >= 500000 && insertedTotal - lastLogged >= 500000) {
+                                    lastLogged = insertedTotal;
+                                    console.log(`    ... [${t.tableName}] ${insertedTotal.toLocaleString('es-CL')} / ${totalRows.toLocaleString('es-CL')} filas (${Math.round((insertedTotal / totalRows) * 100)}%)`);
+                                }
+                                streamReq.resume();
+                            })
+                            .catch(err => {
+                                streamReq.cancel();
+                                reject(err);
+                            });
+                    }
+                });
+
+                streamReq.on('error', err => reject(err));
+
+                streamReq.on('done', () => {
+                    if (buffer.length > 0) {
+                        flushChunk(buffer).then(resolve).catch(reject);
+                    } else {
+                        resolve();
+                    }
+                });
+
+                streamReq.query(`SELECT ${sqlColList} FROM [${t.schema}].[${t.tableName}] WITH (NOLOCK)`);
+            });
 
             // Verificación de cuadratura exacta 1:1
             const pgCountRes = await client.query(`SELECT COUNT(*)::int AS c FROM ${pgIdent(t.pgTableName)}`);
