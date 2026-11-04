@@ -70,7 +70,44 @@ npm install
 
 ---
 
-## 3. Protocolo de Corte Productivo ("Zero-Data-Loss Cutover" en 3 Minutos)
+## 3. Operación en Paralelo / Marcha Blanca Bidireccional (Ambos Sistemas Activos)
+
+Durante la **Marcha Blanca**, los usuarios pueden seguir ocupando el sistema antiguo (que escribe en **SQL Server**) y al mismo tiempo ocupar el nuevo sistema Web (que opera con **PostgreSQL**). Para mantener **ambas bases de datos 100% iguales en tiempo real** sin importar por cuál sistema entre el dato:
+
+### A. Activar Escritura Dual (`DB_ENGINE=dual`) en el `.env` del Nuevo Sistema Web
+En el archivo `backend/.env` del sistema Web, define `DB_ENGINE=dual`:
+```env
+DB_ENGINE=dual
+
+# Conexión SQL Server Actual
+DB_USER=sa
+DB_PASS=Total2014
+DB_SERVER=192.168.3.251
+DB_NAME=Archivo
+
+# Conexión Nuevo PostgreSQL Interno
+PG_HOST=192.168.3.250
+PG_PORT=5432
+PG_USER=cmds_admin
+PG_PASS=CmdsPostgres2026!
+PG_DB=bd_archivo
+```
+Con `DB_ENGINE=dual`:
+1. Cada `INSERT`, `UPDATE` o `DELETE` realizado en el sistema Web se guarda **simultáneamente en PostgreSQL y en SQL Server** en el mismo milisegundo.
+2. Los correlativos (`MAX(NumMov) + 1`, `MAX(NumExp) + 1`, `MAX(NumMovCom) + 1`) se calculan consultando ambos motores (`Math.max`) para que **jamás se pisen los folios/solicitudes** entre el sistema viejo y el nuevo.
+
+### B. Activar el Demonio de Sincronización Bidireccional (`marcha-blanca-sync.js`)
+Para que todo lo que un funcionario ingrese o devuelva en el sistema antiguo VB.NET (`Archivo.exe`) caiga automáticamente en PostgreSQL cada 10 segundos, deja corriendo con PM2 el demonio [`marcha-blanca-sync.js`](./marcha-blanca-sync.js):
+```bash
+cd sistema-archivo-web/migracion-postgres
+pm2 start marcha-blanca-sync.js --name "marcha-blanca-sync" -- --pg-host=192.168.3.250 --interval=10
+pm2 save
+```
+Cuando termine el período de Marcha Blanca y des de baja el sistema antiguo, simplemente detienes el demonio (`pm2 delete marcha-blanca-sync`) y cambias `DB_ENGINE=postgres` en el `.env`.
+
+---
+
+## 4. Protocolo de Corte Productivo ("Zero-Data-Loss Cutover" en 3 Minutos)
 
 Como los sistemas actuales siguen recibiendo datos en SQL Server hasta el momento exacto del cambio, **el día y minuto en que pases un sistema a producción con PostgreSQL** sigue estos 4 pasos:
 

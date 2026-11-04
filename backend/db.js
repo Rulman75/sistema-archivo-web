@@ -189,21 +189,152 @@ class PgRequestWrapper {
     }
 }
 
-let poolPromise;
+class DualRequestWrapper {
+    constructor(mssqlPool, pgPool) {
+        this.mssqlReq = mssqlPool.request();
+        this.pgReq = new PgRequestWrapper(pgPool);
+    }
 
-if (DB_ENGINE === 'postgres' || DB_ENGINE === 'pg' || DB_ENGINE === 'postgresql') {
-    const pgConfig = process.env.DATABASE_URL
+    input(name, typeOrVal, val) {
+        if (arguments.length === 2) {
+            this.mssqlReq.input(name, typeOrVal);
+            this.pgReq.input(name, typeOrVal);
+        } else {
+            this.mssqlReq.input(name, typeOrVal, val);
+            this.pgReq.input(name, typeOrVal, val);
+        }
+        return this;
+    }
+
+    async query(queryText) {
+        const qTrim = String(queryText).trim();
+        const isWrite = /^\s*(INSERT|UPDATE|DELETE)\b/i.test(qTrim);
+        const isMaxQuery = /\bMAX\s*\(/i.test(qTrim) && /^\s*SELECT\b/i.test(qTrim);
+
+        if (isWrite) {
+            // Modo Marcha Blanca: Escribir simultáneamente en PostgreSQL y SQL Server
+            const [pgOutcome, mssqlOutcome] = await Promise.allSettled([
+                this.pgReq.query(queryText),
+                this.mssqlReq.query(queryText)
+            ]);
+            if (pgOutcome.status === 'rejected') {
+                console.error('[DUAL-WRITE] Error en PostgreSQL:', pgOutcome.reason?.message);
+            }
+            if (mssqlOutcome.status === 'rejected') {
+                console.error('[DUAL-WRITE] Error en SQL Server:', mssqlOutcome.reason?.message);
+            }
+            if (pgOutcome.status === 'fulfilled') return pgOutcome.value;
+            if (mssqlOutcome.status === 'fulfilled') return mssqlOutcome.value;
+            throw pgOutcome.reason || mssqlOutcome.reason;
+        }
+
+        if (isMaxQuery) {
+            // Coordinar correlativos (MAX + 1) entre ambos motores para evitar colisiones de IDs
+            const [pgRes, mssqlRes] = await Promise.all([
+                this.pgReq.query(queryText),
+                this.mssqlReq.query(queryText)
+            ]);
+            const rowPg = (pgRes.recordset && pgRes.recordset[0]) || {};
+            const rowMs = (mssqlRes.recordset && mssqlRes.recordset[0]) || {};
+            const merged = { ...rowPg };
+            for (const key of Object.keys(rowMs)) {
+                const vPg = Number(merged[key]);
+                const vMs = Number(rowMs[key]);
+                if (!isNaN(vPg) && !isNaN(vMs)) {
+                    merged[key] = Math.max(vPg, vMs);
+                }
+            }
+            return {
+                recordset: [merged],
+                recordsets: [[merged]],
+                rowsAffected: [1]
+            };
+        }
+
+        // Lecturas normales: leer desde PostgreSQL (con fallback automático a SQL Server)
+        try {
+            return await this.pgReq.query(queryText);
+        } catch (err) {
+            console.warn('[DUAL-READ] Fallback a SQL Server por:', err.message);
+            return await this.mssqlReq.query(queryText);
+        }
+    }
+}
+
+function createPgConfig(defaultDbName) {
+    return process.env.DATABASE_URL
         ? { connectionString: process.env.DATABASE_URL }
         : {
-              host: process.env.PG_HOST || process.env.DB_SERVER || '127.0.0.1',
-              port: parseInt(process.env.PG_PORT || process.env.DB_PORT || '5432', 10),
-              user: process.env.PG_USER || process.env.DB_USER || 'cmds_admin',
-              password: process.env.PG_PASS || process.env.DB_PASS || 'CmdsPostgres2026!',
-              database: process.env.PG_DB || process.env.DB_NAME || 'bd_archivo',
+              host: process.env.PG_HOST || '127.0.0.1',
+              port: parseInt(process.env.PG_PORT || '5432', 10),
+              user: process.env.PG_USER || 'cmds_admin',
+              password: process.env.PG_PASS || 'CmdsPostgres2026!',
+              database: process.env.PG_DB || defaultDbName,
               max: 15,
               idleTimeoutMillis: 30000
           };
+}
 
+function createMssqlConfig() {
+    const rawServer = process.env.DB_SERVER || '192.168.3.251';
+    const [serverHost, instanceName] = rawServer.includes('\\')
+        ? rawServer.split('\\')
+        : [rawServer, undefined];
+
+    return {
+        rawServer,
+        config: {
+            user: process.env.DB_USER,
+            password: process.env.DB_PASS || process.env.DB_PASSWORD,
+            server: process.env.DB_PORT ? serverHost : rawServer,
+            ...(process.env.DB_PORT ? { port: Number(process.env.DB_PORT) } : {}),
+            database: process.env.DB_NAME,
+            requestTimeout: 90000,
+            connectionTimeout: 30000,
+            options: {
+                encrypt: false,
+                trustServerCertificate: true,
+                enableArithAbort: true,
+                ...(!process.env.DB_PORT && instanceName ? { instanceName } : {})
+            },
+            pool: {
+                max: 10,
+                min: 0,
+                idleTimeoutMillis: 30000
+            }
+        }
+    };
+}
+
+let poolPromise;
+
+if (DB_ENGINE === 'dual' || DB_ENGINE === 'ambos' || DB_ENGINE === 'marcha_blanca') {
+    const pgConfig = createPgConfig('bd_archivo');
+    const { rawServer, config: mssqlConfig } = createMssqlConfig();
+    const pgPool = new PgPool(pgConfig);
+
+    poolPromise = Promise.all([
+        new sql.ConnectionPool(mssqlConfig).connect(),
+        pgPool.query('SELECT 1')
+    ])
+        .then(([mssqlPool]) => {
+            console.log(
+                `[MODO MARCHA BLANCA DUAL] Conectado simultáneamente a SQL Server (${rawServer} -> ${mssqlConfig.database}) y PostgreSQL (${pgConfig.host} -> ${pgConfig.database})`
+            );
+            return {
+                request: () => new DualRequestWrapper(mssqlPool, pgPool),
+                query: (q) => new DualRequestWrapper(mssqlPool, pgPool).query(q),
+                close: async () => {
+                    await Promise.allSettled([mssqlPool.close(), pgPool.end()]);
+                }
+            };
+        })
+        .catch(err => {
+            console.error('Error al inicializar conexión DUAL (SQL Server + PostgreSQL):', err.message);
+            throw err;
+        });
+} else if (DB_ENGINE === 'postgres' || DB_ENGINE === 'pg' || DB_ENGINE === 'postgresql') {
+    const pgConfig = createPgConfig('bd_archivo');
     const pgPool = new PgPool(pgConfig);
     poolPromise = pgPool
         .query('SELECT 1')
@@ -220,31 +351,7 @@ if (DB_ENGINE === 'postgres' || DB_ENGINE === 'pg' || DB_ENGINE === 'postgresql'
             throw err;
         });
 } else {
-    const rawServer = process.env.DB_SERVER || '192.168.3.251';
-    const [serverHost, instanceName] = rawServer.includes('\\')
-        ? rawServer.split('\\')
-        : [rawServer, undefined];
-
-    const config = {
-        user: process.env.DB_USER,
-        password: process.env.DB_PASS || process.env.DB_PASSWORD,
-        server: process.env.DB_PORT ? serverHost : rawServer,
-        ...(process.env.DB_PORT ? { port: Number(process.env.DB_PORT) } : {}),
-        database: process.env.DB_NAME,
-        requestTimeout: 90000,
-        connectionTimeout: 30000,
-        options: {
-            encrypt: false,
-            trustServerCertificate: true,
-            enableArithAbort: true,
-            ...(!process.env.DB_PORT && instanceName ? { instanceName } : {})
-        },
-        pool: {
-            max: 10,
-            min: 0,
-            idleTimeoutMillis: 30000
-        }
-    };
+    const { rawServer, config } = createMssqlConfig();
 
     poolPromise = new sql.ConnectionPool(config)
         .connect()
