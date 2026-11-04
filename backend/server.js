@@ -308,7 +308,7 @@ app.get('/api/dashboard/stats', async (req, res) => {
             ) t
             LEFT JOIN LIC_FUNCIONARIO f
                 ON REPLACE(LTRIM(RTRIM(f.Rut)), '0', '') = REPLACE(LTRIM(RTRIM(t.Rut)), '0', '')
-                AND LTRIM(RTRIM(f.Rut)) IN (LTRIM(RTRIM(t.Rut)), '0' + LTRIM(RTRIM(t.Rut)))
+                AND LTRIM(RTRIM(f.Rut)) IN (LTRIM(RTRIM(t.Rut)), CONCAT('0', LTRIM(RTRIM(t.Rut))))
             WHERE t.rn = 1 AND UPPER(LTRIM(RTRIM(t.Estado))) = 'ENTREGADO'
             ORDER BY t.NumMov DESC
         `);
@@ -356,7 +356,7 @@ app.get('/api/expedientes/funcionarios', async (req, res) => {
                 OR LTRIM(RTRIM(f.Materno)) LIKE @q
                 OR LTRIM(RTRIM(f.Nombre)) LIKE @q
                 OR LTRIM(RTRIM(ISNULL(e.Kardex, ''))) LIKE @q
-                OR (LTRIM(RTRIM(f.Nombre)) + ' ' + LTRIM(RTRIM(f.Paterno)) + ' ' + LTRIM(RTRIM(f.Materno))) LIKE @q
+                OR CONCAT(LTRIM(RTRIM(f.Nombre)), ' ', LTRIM(RTRIM(f.Paterno)), ' ', LTRIM(RTRIM(f.Materno))) LIKE @q
             )`);
         }
 
@@ -672,14 +672,16 @@ app.post('/api/expedientes/ficha', async (req, res) => {
                 `);
         } else {
             accion = 'creado';
+            const nextExpRes = await pool.request().query(`SELECT ISNULL(MAX(NumExp), 0) + 1 AS NextExp FROM Expedientes`);
+            const nextExp = nextExpRes.recordset[0].NextExp;
             await pool.request()
                 .input('rut', sql.Char, rutNum)
                 .input('dv', sql.NChar, dvFinal)
                 .input('contenido', sql.NChar, cleanStr(contenido))
                 .input('estado', sql.NChar, cleanStr(estado) || 'Vigente')
+                .input('nextExp', sql.Int, nextExp)
                 .input('kardex', sql.NChar, cleanStr(kardex))
                 .query(`
-                    DECLARE @nextExp INT = ISNULL((SELECT MAX(NumExp) FROM Expedientes), 0) + 1;
                     INSERT INTO Expedientes (
                         Rut, Dv, Contenido, Estado, Fechacreacion, NumExp, Kardex
                     ) VALUES (
@@ -750,7 +752,7 @@ app.get('/api/expedientes/bitacora', async (req, res) => {
                 m.nomina AS Nomina
             FROM Movimientos m
             LEFT JOIN LIC_FUNCIONARIO f
-                ON LTRIM(RTRIM(f.Rut)) IN (LTRIM(RTRIM(m.Rut)), '0' + LTRIM(RTRIM(m.Rut)))
+                ON LTRIM(RTRIM(f.Rut)) IN (LTRIM(RTRIM(m.Rut)), CONCAT('0', LTRIM(RTRIM(m.Rut))))
             ${whereSql}
             ORDER BY m.NumMov DESC
         `);
@@ -813,23 +815,23 @@ app.post('/api/expedientes/bitacora/entrega', async (req, res) => {
             });
         }
 
-        const insertRes = await pool.request()
+        const nextMovRes = await pool.request().query(`SELECT ISNULL(MAX(NumMov), 0) + 1 AS NextMov FROM Movimientos`);
+        const numMovCreado = nextMovRes.recordset[0].NextMov;
+
+        await pool.request()
+            .input('nextMov', sql.Int, numMovCreado)
             .input('rut', sql.NChar, rutNum)
             .input('unidad', sql.NChar, cleanStr(unidad))
             .input('responsable', sql.NChar, cleanStr(responsable).toUpperCase())
             .input('observacion', sql.NChar, cleanStr(observacion))
             .input('fecha', sql.NChar, fechaFormateada)
             .query(`
-                DECLARE @nextMov INT = ISNULL((SELECT MAX(NumMov) FROM Movimientos), 0) + 1;
                 INSERT INTO Movimientos (
                     NumMov, Rut, Unidad, Responsable, Observacion, Fecha, FechaDev, Estado
                 ) VALUES (
                     @nextMov, @rut, @unidad, @responsable, @observacion, @fecha, '', 'ENTREGADO'
-                );
-                SELECT @nextMov AS NumMovCreado;
+                )
             `);
-
-        const numMovCreado = insertRes.recordset[0].NumMovCreado;
         res.json({
             status: 'ok',
             numMov: numMovCreado,
@@ -922,7 +924,7 @@ app.get('/api/expedientes/nominas/:nomina', async (req, res) => {
                     m.nomina AS Nomina
                 FROM Movimientos m
                 LEFT JOIN LIC_FUNCIONARIO f
-                    ON LTRIM(RTRIM(f.Rut)) IN (LTRIM(RTRIM(m.Rut)), '0' + LTRIM(RTRIM(m.Rut)))
+                    ON LTRIM(RTRIM(f.Rut)) IN (LTRIM(RTRIM(m.Rut)), CONCAT('0', LTRIM(RTRIM(m.Rut))))
                 WHERE m.nomina = @nomina
                 ORDER BY m.NumMov ASC
             `);
@@ -1005,7 +1007,11 @@ app.post('/api/expedientes/nominas/entrega', async (req, res) => {
         }
 
         // 3. Insertar en Movimientos asociado a la Nómina
-        const insertRes = await pool.request()
+        const nextMovRes = await pool.request().query(`SELECT ISNULL(MAX(NumMov), 0) + 1 AS NextMov FROM Movimientos`);
+        const numMovCreado = nextMovRes.recordset[0].NextMov;
+
+        await pool.request()
+            .input('nextMov', sql.Int, numMovCreado)
             .input('rut', sql.NChar, rutNum)
             .input('unidad', sql.NChar, cleanStr(unidad))
             .input('responsable', sql.NChar, cleanStr(responsable).toUpperCase())
@@ -1013,19 +1019,17 @@ app.post('/api/expedientes/nominas/entrega', async (req, res) => {
             .input('fecha', sql.NChar, fechaFormateada)
             .input('nomina', sql.Int, numNomina)
             .query(`
-                DECLARE @nextMov INT = ISNULL((SELECT MAX(NumMov) FROM Movimientos), 0) + 1;
                 INSERT INTO Movimientos (
                     NumMov, Rut, Unidad, Responsable, Observacion, Fecha, FechaDev, Estado, nomina
                 ) VALUES (
                     @nextMov, @rut, @unidad, @responsable, @observacion, @fecha, '', 'ENTREGADO', @nomina
-                );
-                SELECT @nextMov AS NumMovCreado;
+                )
             `);
 
         const f = funcRes.recordset[0];
         res.json({
             status: 'ok',
-            numMov: insertRes.recordset[0].NumMovCreado,
+            numMov: numMovCreado,
             funcionario: `${f.Nombre} ${f.Paterno} ${f.Materno}`.trim(),
             message: `Expediente de ${f.Nombre} ${f.Paterno} agregado a la Nómina N° ${numNomina}`
         });
@@ -1150,15 +1154,16 @@ app.get('/api/comprobantes/lista', async (req, res) => {
                 ult.Responsable AS UltimoResponsable,
                 ult.Unidad AS UltimaUnidad
             FROM Comprobantes c
-            OUTER APPLY (
-                SELECT TOP 1
+            LEFT JOIN (
+                SELECT
+                    NumComp,
                     LTRIM(RTRIM(Estado)) AS Estado,
                     LTRIM(RTRIM(Responsable)) AS Responsable,
-                    LTRIM(RTRIM(Unidad)) AS Unidad
-                FROM MovimientosComp mc
-                WHERE mc.NumComp = c.NumComp
-                ORDER BY mc.NumMovCom DESC
-            ) ult
+                    LTRIM(RTRIM(Unidad)) AS Unidad,
+                    ROW_NUMBER() OVER (PARTITION BY NumComp ORDER BY NumMovCom DESC) AS rn
+                FROM MovimientosComp
+                WHERE NumComp IS NOT NULL
+            ) ult ON ult.NumComp = c.NumComp AND ult.rn = 1
             ${whereSql}
             ORDER BY c.NumComp DESC
         `);
@@ -1424,26 +1429,28 @@ app.post('/api/comprobantes/bitacora/entrega', async (req, res) => {
             });
         }
 
-        const insertRes = await pool.request()
+        const nextMovRes = await pool.request().query(`SELECT ISNULL(MAX(NumMovCom), 0) + 1 AS NextMov FROM MovimientosComp`);
+        const numMovComCreado = nextMovRes.recordset[0].NextMov;
+
+        await pool.request()
+            .input('nextMov', sql.Int, numMovComCreado)
             .input('numComp', sql.Int, nComp)
             .input('unidad', sql.VarChar, cleanStr(unidad))
             .input('responsable', sql.VarChar, cleanStr(responsable).toUpperCase())
             .input('observacion', sql.VarChar, cleanStr(observacion))
             .input('fechaEnt', sql.VarChar, fechaFormateada)
             .query(`
-                DECLARE @nextMov INT = ISNULL((SELECT MAX(NumMovCom) FROM MovimientosComp), 0) + 1;
                 INSERT INTO MovimientosComp (
                     NumMovCom, NumComp, Unidad, Responsable, Observacion, FechaEnt, FechaDev, Estado
                 ) VALUES (
                     @nextMov, @numComp, @unidad, @responsable, @observacion, @fechaEnt, '', 'ENTREGADO'
-                );
-                SELECT @nextMov AS NumMovComCreado;
+                )
             `);
 
         res.json({
             status: 'ok',
-            numMovCom: insertRes.recordset[0].NumMovComCreado,
-            message: `Entrega del Comprobante N° ${nComp} registrada con Solicitud N° ${insertRes.recordset[0].NumMovComCreado}`
+            numMovCom: numMovComCreado,
+            message: `Entrega del Comprobante N° ${nComp} registrada con Solicitud N° ${numMovComCreado}`
         });
     } catch (error) {
         console.error('Error en POST /api/comprobantes/bitacora/entrega:', error);
@@ -1590,7 +1597,11 @@ app.post('/api/comprobantes/nominas/entrega', async (req, res) => {
             });
         }
 
-        const insertRes = await pool.request()
+        const nextMovRes = await pool.request().query(`SELECT ISNULL(MAX(NumMovCom), 0) + 1 AS NextMov FROM MovimientosComp`);
+        const numMovComCreado = nextMovRes.recordset[0].NextMov;
+
+        await pool.request()
+            .input('nextMov', sql.Int, numMovComCreado)
             .input('numComp', sql.Int, nComp)
             .input('unidad', sql.VarChar, cleanStr(unidad))
             .input('responsable', sql.VarChar, cleanStr(responsable).toUpperCase())
@@ -1598,18 +1609,16 @@ app.post('/api/comprobantes/nominas/entrega', async (req, res) => {
             .input('fechaEnt', sql.VarChar, fechaFormateada)
             .input('nomina', sql.Int, numNomina)
             .query(`
-                DECLARE @nextMov INT = ISNULL((SELECT MAX(NumMovCom) FROM MovimientosComp), 0) + 1;
                 INSERT INTO MovimientosComp (
                     NumMovCom, NumComp, Unidad, Responsable, Observacion, FechaEnt, FechaDev, Estado, Nomina
                 ) VALUES (
                     @nextMov, @numComp, @unidad, @responsable, @observacion, @fechaEnt, '', 'ENTREGADO', @nomina
-                );
-                SELECT @nextMov AS NumMovComCreado;
+                )
             `);
 
         res.json({
             status: 'ok',
-            numMovCom: insertRes.recordset[0].NumMovComCreado,
+            numMovCom: numMovComCreado,
             message: `Comprobante N° ${nComp} agregado a la Nómina N° ${numNomina}`
         });
     } catch (error) {
@@ -1748,7 +1757,7 @@ app.get('/api/informes/pendientes', async (req, res) => {
                 WHERE LTRIM(RTRIM(ISNULL(Rut, ''))) <> ''
             ) t
             LEFT JOIN LIC_FUNCIONARIO f
-                ON LTRIM(RTRIM(f.Rut)) IN (LTRIM(RTRIM(t.Rut)), '0' + LTRIM(RTRIM(t.Rut)))
+                ON LTRIM(RTRIM(f.Rut)) IN (LTRIM(RTRIM(t.Rut)), CONCAT('0', LTRIM(RTRIM(t.Rut))))
             WHERE t.rn = 1 AND UPPER(LTRIM(RTRIM(t.Estado))) = 'ENTREGADO' ${extraWhere}
             ORDER BY t.NumMov DESC
         `);
