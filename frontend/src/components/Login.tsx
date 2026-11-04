@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import axios from 'axios';
+import { VERSION_DISPLAY, VERSION_TOOLTIP } from '../version';
 
 interface LoginProps {
   onLoginSuccess: (token: string, user: any) => void;
@@ -76,6 +77,14 @@ const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
             <p className="text-xs text-blue-200 mt-2">
               Control de Kárdex, Bitácoras de Préstamo y Nóminas Oficiales
             </p>
+            <div className="mt-4">
+              <span
+                title={VERSION_TOOLTIP}
+                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-white/15 text-blue-50 border border-white/20 shadow-sm tracking-wide"
+              >
+                Versión {VERSION_DISPLAY}
+              </span>
+            </div>
           </div>
 
           <div className="z-10 text-xs text-blue-200">

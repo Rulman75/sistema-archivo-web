@@ -13,6 +13,11 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+const pkg = require('./package.json');
+app.get('/api/version', (req, res) => {
+    res.json({ version: pkg.version || '1.1.0' });
+});
+
 // ============================================================================
 // UTILIDADES DE NORMALIZACIÓN (RUT, DV, FECHAS DD-MM-YYYY Y TEXTOS CHAR/NCHAR)
 // ============================================================================
