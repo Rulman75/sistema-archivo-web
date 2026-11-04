@@ -85,9 +85,9 @@ sudo sed -i "s/^#*\s*max_connections\s*=.*/max_connections = 200/" "${PG_CONF}"
 if ! sudo grep -q "${LAN_SUBNET}" "${PG_HBA}"; then
   echo "" | sudo tee -a "${PG_HBA}" >/dev/null
   echo "# Acceso exclusivo Red Interna LAN CMDS (Sin exposición a Internet)" | sudo tee -a "${PG_HBA}" >/dev/null
-  echo "host    all             all             ${LAN_SUBNET}           md5" | sudo tee -a "${PG_HBA}" >/dev/null
-  echo "host    all             all             10.0.0.0/8              md5" | sudo tee -a "${PG_HBA}" >/dev/null
-  echo "host    all             all             172.16.0.0/12           md5" | sudo tee -a "${PG_HBA}" >/dev/null
+  echo "host    all             all             ${LAN_SUBNET}           scram-sha-256" | sudo tee -a "${PG_HBA}" >/dev/null
+  echo "host    all             all             10.0.0.0/8              scram-sha-256" | sudo tee -a "${PG_HBA}" >/dev/null
+  echo "host    all             all             172.16.0.0/12           scram-sha-256" | sudo tee -a "${PG_HBA}" >/dev/null
 fi
 
 sudo systemctl restart postgresql
