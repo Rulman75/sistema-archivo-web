@@ -113,20 +113,11 @@ function translateTSqlToPostgres(queryText, paramsMap) {
     q = q.replace(/\bGETDATE\s*\(\s*\)/gi, 'CURRENT_TIMESTAMP');
     q = q.replace(/\bLEN\s*\(/gi, 'LENGTH(');
 
-    // 3. Transformar SELECT TOP (N) o SELECT TOP N a LIMIT N
-    // 3a. Consultas o subconsultas con ORDER BY
-    q = q.replace(
-        /\bSELECT\s+(DISTINCT\s+)?TOP\s*\(?\s*(\d+)\s*\)?\s+([\s\S]*?)(ORDER\s+BY\s+[^\n\r;)]+)/gi,
-        (match, distinctPart, limitNum, body, orderClause) => {
-            return `SELECT ${distinctPart || ''}${body}${orderClause} LIMIT ${limitNum}`;
-        }
-    );
-
-    // 3b. Consultas principales con SELECT TOP N sin ORDER BY
+    // 3. Transformar SELECT TOP (N) o SELECT TOP N a LIMIT N al final de la consulta
     q = q.replace(
         /^\s*SELECT\s+(DISTINCT\s+)?TOP\s*\(?\s*(\d+)\s*\)?\s+([\s\S]*?)\s*;?\s*$/i,
         (match, distinctPart, limitNum, body) => {
-            return `SELECT ${distinctPart || ''}${body} LIMIT ${limitNum}`;
+            return `SELECT ${distinctPart || ''}${body.trim()} LIMIT ${limitNum}`;
         }
     );
 

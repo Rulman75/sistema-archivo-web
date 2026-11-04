@@ -1,0 +1,16 @@
+{
+  "name": "migracion-postgres-cmds",
+  "version": "1.0.0",
+  "description": "Kit de Migración y Sincronización Bidireccional SQL Server <-> PostgreSQL CMDS",
+  "main": "sync-sqlserver-to-postgres.js",
+  "scripts": {
+    "sync-etapa1": "node sync-sqlserver-to-postgres.js --etapa=1 --pg-host=192.168.30.47",
+    "sync-etapa2": "node sync-sqlserver-to-postgres.js --etapa=2 --pg-host=192.168.30.47",
+    "sync-etapa3": "node sync-sqlserver-to-postgres.js --etapa=3 --pg-host=192.168.30.47",
+    "marcha-blanca": "node marcha-blanca-sync.js --pg-host=192.168.30.47 --interval=10"
+  },
+  "dependencies": {
+    "mssql": "^12.2.0",
+    "pg": "^8.16.0"
+  }
+}

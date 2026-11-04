@@ -12,7 +12,7 @@ set -e
 
 PG_USER_ADMIN="cmds_admin"
 PG_PASS_ADMIN="${PG_PASS_ADMIN:-CmdsPostgres2026!}"
-LAN_SUBNET="${LAN_SUBNET:-192.168.3.0/24}"
+LAN_SUBNET="${LAN_SUBNET:-192.168.0.0/16}"
 BACKUP_DIR="/var/backups/postgresql/cmds"
 
 # Todas las bases de datos a crear en el servidor central PostgreSQL
