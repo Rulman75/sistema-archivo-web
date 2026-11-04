@@ -29,8 +29,12 @@
  * ============================================================================
  */
 
-const sql = require('mssql');
-const { Pool: PgPool } = require('pg');
+const path = require('path');
+const loadMod = (name) => {
+    try { return require(name); } catch { return require(path.join(__dirname, '../backend/node_modules', name)); }
+};
+const sql = loadMod('mssql');
+const { Pool: PgPool } = loadMod('pg');
 
 const args = process.argv.slice(2);
 const getArg = (prefix, def) => {
