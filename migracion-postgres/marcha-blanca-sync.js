@@ -42,7 +42,7 @@ const getArg = (prefix, def) => {
     return found ? found.split('=')[1] : def;
 };
 
-const PG_HOST = getArg('--pg-host', process.env.PG_HOST || '127.0.0.1');
+const PG_HOST = getArg('--pg-host', process.env.PG_HOST || '192.168.30.47');
 const PG_PORT = parseInt(getArg('--pg-port', process.env.PG_PORT || '5432'), 10);
 const PG_USER = getArg('--pg-user', process.env.PG_USER || 'cmds_admin');
 const PG_PASS = getArg('--pg-pass', process.env.PG_PASS || 'CmdsPostgres2026!');
@@ -51,7 +51,7 @@ const RUN_ONCE = args.includes('--once');
 
 function clean(val) {
     if (val === null || val === undefined) return '';
-    return String(val).trim();
+    return String(val).replace(/[\0-\x1F\x7F]/g, '').trim();
 }
 
 function normRutKey(rutRaw) {
@@ -152,8 +152,10 @@ async function syncBidireccionalArchivo(msPool, pgPool) {
                 .input('estado', sql.NChar, clean(pgRow.Estado))
                 .input('nomina', sql.Int, pgRow.nomina)
                 .query(`
+                    SET IDENTITY_INSERT Movimientos ON;
                     INSERT INTO Movimientos (NumMov, NumExp, Rut, Unidad, Responsable, Observacion, Fecha, FechaDev, Estado, nomina)
-                    VALUES (@numMov, @numExp, @rut, @unidad, @responsable, @observacion, @fecha, @fechaDev, @estado, @nomina)
+                    VALUES (@numMov, @numExp, @rut, @unidad, @responsable, @observacion, @fecha, @fechaDev, @estado, @nomina);
+                    SET IDENTITY_INSERT Movimientos OFF;
                 `);
             cambiosPgASql++;
         } else if (
@@ -257,8 +259,10 @@ async function syncBidireccionalArchivo(msPool, pgPool) {
                 .input('estado', sql.VarChar, clean(pgRow.Estado))
                 .input('nomina', sql.Int, pgRow.Nomina)
                 .query(`
+                    SET IDENTITY_INSERT MovimientosComp ON;
                     INSERT INTO MovimientosComp (NumMovCom, NumComp, Unidad, Responsable, Observacion, FechaEnt, FechaDev, Estado, Nomina)
-                    VALUES (@numMovCom, @numComp, @unidad, @responsable, @observacion, @fechaEnt, @fechaDev, @estado, @nomina)
+                    VALUES (@numMovCom, @numComp, @unidad, @responsable, @observacion, @fechaEnt, @fechaDev, @estado, @nomina);
+                    SET IDENTITY_INSERT MovimientosComp OFF;
                 `);
             cambiosPgASql++;
         } else if (
@@ -358,11 +362,11 @@ async function syncBidireccionalArchivo(msPool, pgPool) {
     }
 
     // ------------------------------------------------------------------------
-    // D. Tabla Expedientes (PK lógica: Rut normalizado)
+    // D. Tabla Expedientes (PK real en SQL Server: NumExp / PK_Expedientes)
     // ------------------------------------------------------------------------
     const [msExpRes, pgExpRes] = await Promise.all([
         msPool.request().query(`
-            SELECT LTRIM(RTRIM(Rut)) AS Rut,
+            SELECT LTRIM(RTRIM(ISNULL(Rut, ''))) AS Rut,
                    LTRIM(RTRIM(ISNULL(Dv, ''))) AS Dv,
                    LTRIM(RTRIM(ISNULL(Contenido, ''))) AS Contenido,
                    LTRIM(RTRIM(ISNULL(Estado, ''))) AS Estado,
@@ -371,10 +375,10 @@ async function syncBidireccionalArchivo(msPool, pgPool) {
                    NumExp,
                    LTRIM(RTRIM(ISNULL(Kardex, ''))) AS Kardex
             FROM Expedientes
-            WHERE LTRIM(RTRIM(ISNULL(Rut, ''))) <> ''
+            WHERE NumExp IS NOT NULL
         `),
         pgPool.query(`
-            SELECT TRIM(rut) AS "Rut",
+            SELECT COALESCE(TRIM(rut), '') AS "Rut",
                    COALESCE(TRIM(dv), '') AS "Dv",
                    COALESCE(TRIM(contenido), '') AS "Contenido",
                    COALESCE(TRIM(estado), '') AS "Estado",
@@ -383,16 +387,16 @@ async function syncBidireccionalArchivo(msPool, pgPool) {
                    numexp AS "NumExp",
                    COALESCE(TRIM(kardex), '') AS "Kardex"
             FROM expedientes
-            WHERE COALESCE(TRIM(rut), '') <> ''
+            WHERE numexp IS NOT NULL
         `)
     ]);
 
-    const msExpMap = new Map(msExpRes.recordset.map(r => [normRutKey(r.Rut), r]));
-    const pgExpMap = new Map(pgExpRes.rows.map(r => [normRutKey(r.Rut), r]));
+    const msExpMap = new Map(msExpRes.recordset.map(r => [Number(r.NumExp), r]));
+    const pgExpMap = new Map(pgExpRes.rows.map(r => [Number(r.NumExp), r]));
 
-    for (const [rutKey, msRow] of msExpMap.entries()) {
-        if (!rutKey) continue;
-        const pgRow = pgExpMap.get(rutKey);
+    for (const [numExp, msRow] of msExpMap.entries()) {
+        if (!numExp) continue;
+        const pgRow = pgExpMap.get(numExp);
         if (!pgRow) {
             await pgPool.query(
                 `INSERT INTO expedientes (rut, dv, contenido, estado, observacion, fechacreacion, numexp, kardex)
@@ -404,7 +408,7 @@ async function syncBidireccionalArchivo(msPool, pgPool) {
                     clean(msRow.Estado),
                     clean(msRow.Observacion),
                     msRow.Fechacreacion || new Date(),
-                    msRow.NumExp,
+                    numExp,
                     clean(msRow.Kardex)
                 ]
             );
@@ -417,29 +421,31 @@ async function syncBidireccionalArchivo(msPool, pgPool) {
             await pgPool.query(
                 `UPDATE expedientes
                  SET contenido = $1, estado = $2, kardex = $3
-                 WHERE TRIM(rut) IN ($4, $5)`,
-                [clean(msRow.Contenido), clean(msRow.Estado), clean(msRow.Kardex), rutKey, '0' + rutKey]
+                 WHERE numexp = $4`,
+                [clean(msRow.Contenido), clean(msRow.Estado), clean(msRow.Kardex), numExp]
             );
             cambiosSqlAPg++;
         }
     }
 
-    for (const [rutKey, pgRow] of pgExpMap.entries()) {
-        if (!rutKey) continue;
-        if (!msExpMap.has(rutKey)) {
+    for (const [numExp, pgRow] of pgExpMap.entries()) {
+        if (!numExp) continue;
+        if (!msExpMap.has(numExp)) {
             await msPool
                 .request()
-                .input('rut', sql.Char, clean(pgRow.Rut))
-                .input('dv', sql.NChar, clean(pgRow.Dv))
-                .input('contenido', sql.NChar, clean(pgRow.Contenido))
-                .input('estado', sql.NChar, clean(pgRow.Estado))
-                .input('observacion', sql.NChar, clean(pgRow.Observacion))
+                .input('rut', sql.VarChar, clean(pgRow.Rut))
+                .input('dv', sql.VarChar, clean(pgRow.Dv))
+                .input('contenido', sql.VarChar, clean(pgRow.Contenido))
+                .input('estado', sql.VarChar, clean(pgRow.Estado))
+                .input('observacion', sql.VarChar, clean(pgRow.Observacion))
                 .input('fecha', sql.DateTime, pgRow.Fechacreacion || new Date())
-                .input('numExp', sql.Int, pgRow.NumExp)
-                .input('kardex', sql.NChar, clean(pgRow.Kardex))
+                .input('numExp', sql.Int, numExp)
+                .input('kardex', sql.VarChar, clean(pgRow.Kardex))
                 .query(`
+                    SET IDENTITY_INSERT Expedientes ON;
                     INSERT INTO Expedientes (Rut, Dv, Contenido, Estado, Observacion, Fechacreacion, NumExp, Kardex)
-                    VALUES (@rut, @dv, @contenido, @estado, @observacion, @fecha, @numExp, @kardex)
+                    VALUES (@rut, @dv, @contenido, @estado, @observacion, @fecha, @numExp, @kardex);
+                    SET IDENTITY_INSERT Expedientes OFF;
                 `);
             cambiosPgASql++;
         }

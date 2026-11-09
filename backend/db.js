@@ -1,11 +1,17 @@
 const sql = require('mssql');
-const { Pool: PgPool, types: pgTypes } = require('pg');
 require('dotenv').config();
 
-// Convertir INT8 / BIGINT (ej. COUNT(*) en PostgreSQL) a Number de JS igual que mssql
-pgTypes.setTypeParser(20, val => (val === null ? null : parseInt(val, 10)));
+let PgPool = null;
+try {
+    const pgMod = require('pg');
+    PgPool = pgMod.Pool;
+    // Convertir INT8 / BIGINT (ej. COUNT(*) en PostgreSQL) a Number de JS igual que mssql
+    pgMod.types.setTypeParser(20, val => (val === null ? null : parseInt(val, 10)));
+} catch (e) {
+    console.warn('[AVISO] Paquete pg no disponible; usando SQL Server como respaldo.');
+}
 
-const DB_ENGINE = (process.env.DB_ENGINE || 'dual').toLowerCase();
+const DB_ENGINE = PgPool ? (process.env.DB_ENGINE || 'dual').toLowerCase() : 'mssql';
 
 // ============================================================================
 // TRADUCTOR Y ADAPTADOR HÍBRIDO SQL SERVER <-> POSTGRESQL
@@ -203,10 +209,18 @@ class DualRequestWrapper {
         const isMaxQuery = /\bMAX\s*\(/i.test(qTrim) && /^\s*SELECT\b/i.test(qTrim);
 
         if (isWrite) {
+            // En SQL Server, las tablas Expedientes, Movimientos y MovimientosComp tienen columna IDENTITY
+            let mssqlQueryText = queryText;
+            const idTableMatch = qTrim.match(/^\s*INSERT\s+INTO\s+(Expedientes|Movimientos|MovimientosComp)\s*\(/i);
+            if (idTableMatch) {
+                const tbl = idTableMatch[1];
+                mssqlQueryText = `SET IDENTITY_INSERT ${tbl} ON;\n${queryText};\nSET IDENTITY_INSERT ${tbl} OFF;`;
+            }
+
             // Modo Marcha Blanca: Escribir simultáneamente en PostgreSQL y SQL Server
             const [pgOutcome, mssqlOutcome] = await Promise.allSettled([
                 this.pgReq.query(queryText),
-                this.mssqlReq.query(queryText)
+                this.mssqlReq.query(mssqlQueryText)
             ]);
             if (pgOutcome.status === 'rejected') {
                 console.error('[DUAL-WRITE] Error en PostgreSQL:', pgOutcome.reason?.message);
@@ -256,13 +270,14 @@ function createPgConfig(defaultDbName) {
     return process.env.DATABASE_URL
         ? { connectionString: process.env.DATABASE_URL }
         : {
-              host: process.env.PG_HOST || '127.0.0.1',
+              host: process.env.PG_HOST || '192.168.30.47',
               port: parseInt(process.env.PG_PORT || '5432', 10),
               user: process.env.PG_USER || 'cmds_admin',
               password: process.env.PG_PASS || 'CmdsPostgres2026!',
               database: process.env.PG_DB || defaultDbName,
               max: 15,
-              idleTimeoutMillis: 30000
+              idleTimeoutMillis: 30000,
+              connectionTimeoutMillis: 5000
           };
 }
 
@@ -297,71 +312,92 @@ function createMssqlConfig() {
     };
 }
 
-let poolPromise;
+let poolPromise = null;
 
-if (DB_ENGINE === 'dual' || DB_ENGINE === 'ambos' || DB_ENGINE === 'marcha_blanca') {
-    const pgConfig = createPgConfig('bd_archivo');
+async function initPool() {
     const { rawServer, config: mssqlConfig } = createMssqlConfig();
+
+    if (!PgPool || (DB_ENGINE !== 'dual' && DB_ENGINE !== 'ambos' && DB_ENGINE !== 'marcha_blanca' && DB_ENGINE !== 'postgres' && DB_ENGINE !== 'pg' && DB_ENGINE !== 'postgresql')) {
+        const pool = await new sql.ConnectionPool(mssqlConfig).connect();
+        console.log('Conectado a SQL Server exitosamente (' + rawServer + ' -> ' + process.env.DB_NAME + ')');
+        return pool;
+    }
+
+    if (DB_ENGINE === 'postgres' || DB_ENGINE === 'pg' || DB_ENGINE === 'postgresql') {
+        const pgConfig = createPgConfig('bd_archivo');
+        const pgPool = new PgPool(pgConfig);
+        await pgPool.query('SELECT 1');
+        console.log(`Conectado a PostgreSQL exitosamente (${pgConfig.host || 'URL'} -> ${pgConfig.database || 'bd_archivo'})`);
+        return {
+            request: () => new PgRequestWrapper(pgPool),
+            query: (q) => new PgRequestWrapper(pgPool).query(q),
+            close: () => pgPool.end()
+        };
+    }
+
+    // Modo DUAL (SQL Server + PostgreSQL) con fallback automático si uno de los dos no responde
+    const pgConfig = createPgConfig('bd_archivo');
     const pgPool = new PgPool(pgConfig);
 
-    poolPromise = Promise.all([
+    const [mssqlOut, pgOut] = await Promise.allSettled([
         new sql.ConnectionPool(mssqlConfig).connect(),
         pgPool.query('SELECT 1')
-    ])
-        .then(([mssqlPool]) => {
-            console.log(
-                `[MODO MARCHA BLANCA DUAL] Conectado simultáneamente a SQL Server (${rawServer} -> ${mssqlConfig.database}) y PostgreSQL (${pgConfig.host} -> ${pgConfig.database})`
-            );
-            return {
-                request: () => new DualRequestWrapper(mssqlPool, pgPool),
-                query: (q) => new DualRequestWrapper(mssqlPool, pgPool).query(q),
-                close: async () => {
-                    await Promise.allSettled([mssqlPool.close(), pgPool.end()]);
-                }
-            };
-        })
-        .catch(err => {
-            console.error('Error al inicializar conexión DUAL (SQL Server + PostgreSQL):', err.message);
-            throw err;
-        });
-} else if (DB_ENGINE === 'postgres' || DB_ENGINE === 'pg' || DB_ENGINE === 'postgresql') {
-    const pgConfig = createPgConfig('bd_archivo');
-    const pgPool = new PgPool(pgConfig);
-    poolPromise = pgPool
-        .query('SELECT 1')
-        .then(() => {
-            console.log(`Conectado a PostgreSQL exitosamente (${pgConfig.host || 'URL'} -> ${pgConfig.database || 'bd_archivo'})`);
-            return {
-                request: () => new PgRequestWrapper(pgPool),
-                query: (q) => new PgRequestWrapper(pgPool).query(q),
-                close: () => pgPool.end()
-            };
-        })
-        .catch(err => {
-            console.error('Error de conexión a PostgreSQL:', err.message);
-            throw err;
-        });
-} else {
-    const { rawServer, config } = createMssqlConfig();
+    ]);
 
-    poolPromise = new sql.ConnectionPool(config)
-        .connect()
-        .then(pool => {
-            console.log('Conectado a SQL Server exitosamente (' + rawServer + ' -> ' + process.env.DB_NAME + ')');
-            return pool;
-        })
-        .catch(err => {
-            console.error('Error de conexión a la Base de Datos SQL Server: ', err);
-            throw err;
-        });
+    if (mssqlOut.status === 'fulfilled' && pgOut.status === 'fulfilled') {
+        const mssqlPool = mssqlOut.value;
+        console.log(
+            `[MODO MARCHA BLANCA DUAL] Conectado simultáneamente a SQL Server (${rawServer} -> ${mssqlConfig.database}) y PostgreSQL (${pgConfig.host} -> ${pgConfig.database})`
+        );
+        return {
+            mssqlPool,
+            pgPool,
+            request: () => new DualRequestWrapper(mssqlPool, pgPool),
+            query: (q) => new DualRequestWrapper(mssqlPool, pgPool).query(q),
+            close: async () => {
+                await Promise.allSettled([mssqlPool.close(), pgPool.end()]);
+            }
+        };
+    }
+
+    if (mssqlOut.status === 'fulfilled') {
+        console.warn('[DB DUAL] PostgreSQL no disponible (' + (pgOut.reason?.message || 'error') + '). Operando con SQL Server.');
+        pgPool.end().catch(() => {});
+        return mssqlOut.value;
+    }
+
+    if (pgOut.status === 'fulfilled') {
+        console.warn('[DB DUAL] SQL Server no disponible (' + (mssqlOut.reason?.message || 'error') + '). Operando con PostgreSQL.');
+        return {
+            request: () => new PgRequestWrapper(pgPool),
+            query: (q) => new PgRequestWrapper(pgPool).query(q),
+            close: () => pgPool.end()
+        };
+    }
+
+    throw mssqlOut.reason || pgOut.reason;
 }
 
-const getPool = async () => poolPromise;
-const getConnection = async () => poolPromise;
+async function getConnection() {
+    if (!poolPromise) {
+        poolPromise = initPool().catch(err => {
+            console.error('Error de conexión a Base de Datos Archivo:', err.message);
+            poolPromise = null;
+            throw err;
+        });
+    }
+    return poolPromise;
+}
+
+const getPool = getConnection;
+
+getConnection().catch(() => {});
 
 module.exports = {
     sql,
-    poolPromise,
+    get poolPromise() {
+        return getConnection();
+    },
     getPool,
     getConnection,
     DB_ENGINE
