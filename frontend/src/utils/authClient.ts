@@ -16,10 +16,9 @@ export function initAuthInterceptors() {
 
   axios.interceptors.request.use(config => {
     const token = localStorage.getItem('auth_token') || localStorage.getItem('token');
-    if (token && config.url && config.url.startsWith('/api')) {
-      config.headers = config.headers || {};
-      if (!config.headers['Authorization']) {
-        config.headers['Authorization'] = `Bearer ${token}`;
+    if (token && config.url && config.url.startsWith('/api') && config.headers) {
+      if (!config.headers.get('Authorization')) {
+        config.headers.set('Authorization', `Bearer ${token}`);
       }
     }
     return config;
