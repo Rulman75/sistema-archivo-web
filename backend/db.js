@@ -118,6 +118,16 @@ function translateTSqlToPostgres(queryText, paramsMap) {
     q = q.replace(/\bISNULL\s*\(/gi, 'COALESCE(');
     q = q.replace(/\bGETDATE\s*\(\s*\)/gi, 'CURRENT_TIMESTAMP');
     q = q.replace(/\bLEN\s*\(/gi, 'LENGTH(');
+    q = q.replace(/\bYEAR\s*\(\s*CURRENT_TIMESTAMP\s*\)/gi, 'EXTRACT(YEAR FROM CURRENT_TIMESTAMP)::INT');
+    q = q.replace(/\bYEAR\s*\(\s*([^()]+)\s*\)/gi, 'EXTRACT(YEAR FROM $1)::INT');
+    q = q.replace(/\bMONTH\s*\(\s*CURRENT_TIMESTAMP\s*\)/gi, 'EXTRACT(MONTH FROM CURRENT_TIMESTAMP)::INT');
+    q = q.replace(/\bMONTH\s*\(\s*([^()]+)\s*\)/gi, 'EXTRACT(MONTH FROM $1)::INT');
+    q = q.replace(/\bDAY\s*\(\s*CURRENT_TIMESTAMP\s*\)/gi, 'EXTRACT(DAY FROM CURRENT_TIMESTAMP)::INT');
+    q = q.replace(/\bDAY\s*\(\s*([^()]+)\s*\)/gi, 'EXTRACT(DAY FROM $1)::INT');
+    q = q.replace(/\bCONVERT\s*\(\s*varchar(?:\(\d+\))?\s*,\s*([^,]+?)\s*,\s*23\s*\)/gi, "TO_CHAR($1, 'YYYY-MM-DD')");
+    q = q.replace(/\bCONVERT\s*\(\s*varchar(?:\(\d+\))?\s*,\s*([^,]+?)\s*,\s*103\s*\)/gi, "TO_CHAR($1, 'DD/MM/YYYY')");
+    q = q.replace(/\bCONVERT\s*\(\s*varchar(?:\(\d+\))?\s*,\s*([^,]+?)\s*,\s*105\s*\)/gi, "TO_CHAR($1, 'DD-MM-YYYY')");
+    q = q.replace(/\bCONVERT\s*\(\s*varchar(?:\(\d+\))?\s*,\s*([^,]+?)\s*,\s*120\s*\)/gi, "TO_CHAR($1, 'YYYY-MM-DD HH24:MI:SS')");
 
     // 3. Transformar SELECT TOP (N) o SELECT TOP N a LIMIT N al final de la consulta
     q = q.replace(

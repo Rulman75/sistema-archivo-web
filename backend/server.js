@@ -2,20 +2,39 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 require('dotenv').config();
 const { sql, poolPromise } = require('./db');
+const {
+    JWT_SECRET,
+    BCRYPT_ROUNDS,
+    invalidateUserCache,
+    securityHeadersMiddleware,
+    apiRateLimiter,
+    checkLoginIpRateLimit,
+    recordLoginIpResult,
+    registrarAuditoriaAcceso,
+    ensureSecuritySchema,
+    authenticateJWT
+} = require('./middleware/authMiddleware');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
-const JWT_SECRET = process.env.JWT_SECRET || 'cmds_archivo_expedientes_secret_key_2026';
 
+app.set('trust proxy', 1);
+app.use(securityHeadersMiddleware);
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Inicializar esquema de seguridad y hashes Bcrypt al arrancar
+poolPromise
+    .then(pool => ensureSecuritySchema(pool))
+    .catch(err => console.error('[SEGURIDAD ARCHIVO] Error inicializando al arranque:', err.message));
 
 const pkg = require('./package.json');
 app.get('/api/version', (req, res) => {
-    res.json({ version: pkg.version || '1.1.0' });
+    res.json({ version: pkg.version || '1.2.0' });
 });
 
 // ============================================================================
@@ -98,13 +117,14 @@ app.get('/api/health', async (req, res) => {
     } catch (error) {
         res.status(500).json({
             status: 'error',
-            message: 'Fallo al conectar con la Base de Datos Archivo',
-            error: error.message
+            message: 'Fallo al conectar con la Base de Datos Archivo'
         });
     }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.use('/api', apiRateLimiter);
+
+app.post('/api/auth/login', checkLoginIpRateLimit, async (req, res) => {
     const { username, password } = req.body;
     const uClean = cleanStr(username);
     const pClean = cleanStr(password);
@@ -114,48 +134,262 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     try {
-        // 1. Credenciales históricas de LoginForm1.vb ("admin" / "archivo")
-        if (uClean.toLowerCase() === 'admin' && pClean.toLowerCase() === 'archivo') {
-            const userPayload = {
-                username: 'admin',
-                nombre: 'Administrador de Archivo CMDS',
-                role: 'Administrador'
-            };
-            const token = jwt.sign(userPayload, JWT_SECRET, { expiresIn: '12h' });
-            return res.json({ status: 'ok', token, user: userPayload });
-        }
-
-        // 2. Usuarios registrados en LIC_USUARIO de la BD Archivo
         const pool = await poolPromise;
-        const result = await pool.request()
+        const result = await pool
+            .request()
             .input('u', sql.NVarChar, uClean)
-            .input('p', sql.NVarChar, pClean)
             .query(`
                 SELECT TOP 1
                     LTRIM(RTRIM(Usuario)) AS Usuario,
-                    LTRIM(RTRIM(nombreUsuario)) AS nombreUsuario
+                    LTRIM(RTRIM(ISNULL(Password, ''))) AS Clave,
+                    LTRIM(RTRIM(ISNULL(PasswordHash, ''))) AS PasswordHash,
+                    LTRIM(RTRIM(ISNULL(nombreUsuario, ''))) AS nombreUsuario,
+                    LTRIM(RTRIM(ISNULL(Email, ''))) AS Email,
+                    LTRIM(RTRIM(ISNULL(Tipo, 'O'))) AS Tipo,
+                    LTRIM(RTRIM(ISNULL(Unidad, 'cmds'))) AS Unidad,
+                    ISNULL(Activo, 1) AS Activo,
+                    ISNULL(DebeCambiarClave, 0) AS DebeCambiarClave,
+                    ISNULL(IntentosFallidos, 0) AS IntentosFallidos,
+                    BloqueadoHasta
                 FROM LIC_USUARIO
                 WHERE LOWER(LTRIM(RTRIM(Usuario))) = LOWER(@u)
-                  AND LTRIM(RTRIM(Password)) = @p
             `);
 
-        if (result.recordset.length > 0) {
-            const dbUser = result.recordset[0];
-            const userPayload = {
-                username: dbUser.Usuario,
-                nombre: dbUser.nombreUsuario || dbUser.Usuario,
-                role: dbUser.Usuario.toLowerCase() === 'master' ? 'Administrador' : 'Operador Archivo'
-            };
-            const token = jwt.sign(userPayload, JWT_SECRET, { expiresIn: '12h' });
-            return res.json({ status: 'ok', token, user: userPayload });
+        if (!result.recordset || result.recordset.length === 0) {
+            recordLoginIpResult(req, false);
+            await registrarAuditoriaAcceso(pool, {
+                usuario: uClean,
+                evento: 'LOGIN_FAIL',
+                detalle: 'Usuario no existe',
+                req,
+                exitoso: false
+            });
+            return res.status(401).json({ status: 'error', message: 'Usuario o contraseña incorrectos' });
         }
 
-        return res.status(401).json({ status: 'error', message: 'Usuario o contraseña incorrectos' });
+        const dbUser = result.recordset[0];
+
+        if (Number(dbUser.Activo) !== 1) {
+            await registrarAuditoriaAcceso(pool, {
+                usuario: dbUser.Usuario,
+                evento: 'LOGIN_FAIL',
+                detalle: 'Intento de acceso en cuenta suspendida',
+                req,
+                exitoso: false
+            });
+            return res.status(403).json({
+                status: 'error',
+                message: 'Su cuenta de usuario se encuentra suspendida. Contacte al Administrador.'
+            });
+        }
+
+        const now = new Date();
+        if (dbUser.BloqueadoHasta) {
+            const lockUntil = new Date(dbUser.BloqueadoHasta);
+            if (!isNaN(lockUntil.getTime()) && lockUntil > now) {
+                const minsLeft = Math.max(1, Math.ceil((lockUntil.getTime() - now.getTime()) / 60000));
+                return res.status(429).json({
+                    status: 'error',
+                    message: `Cuenta bloqueada temporalmente por seguridad tras múltiples intentos fallidos. Intente en ${minsLeft} minuto(s).`
+                });
+            }
+        }
+
+        let passwordValida = false;
+        if (dbUser.PasswordHash && dbUser.PasswordHash.startsWith('$2')) {
+            passwordValida = await bcrypt.compare(pClean, dbUser.PasswordHash);
+        }
+        if (!passwordValida && dbUser.Clave && dbUser.Clave === pClean) {
+            passwordValida = true;
+            const newHash = await bcrypt.hash(pClean, BCRYPT_ROUNDS);
+            await pool
+                .request()
+                .input('Hash', sql.NVarChar, newHash)
+                .input('User', sql.NVarChar, dbUser.Usuario)
+                .query(`UPDATE LIC_USUARIO SET PasswordHash = @Hash WHERE LOWER(LTRIM(RTRIM(Usuario))) = LOWER(@User)`);
+        }
+
+        if (!passwordValida) {
+            recordLoginIpResult(req, false);
+            const nuevosIntentos = Number(dbUser.IntentosFallidos || 0) + 1;
+            const bloquear = nuevosIntentos >= 5;
+            const lockUntilDate = bloquear ? new Date(Date.now() + 15 * 60 * 1000) : null;
+
+            await pool
+                .request()
+                .input('Intentos', sql.Int, nuevosIntentos)
+                .input('BloqueadoHasta', sql.DateTime, lockUntilDate)
+                .input('User', sql.NVarChar, dbUser.Usuario)
+                .query(`
+                    UPDATE LIC_USUARIO
+                    SET IntentosFallidos = @Intentos,
+                        BloqueadoHasta = @BloqueadoHasta
+                    WHERE LOWER(LTRIM(RTRIM(Usuario))) = LOWER(@User)
+                `);
+
+            await registrarAuditoriaAcceso(pool, {
+                usuario: dbUser.Usuario,
+                evento: bloquear ? 'LOCKOUT' : 'LOGIN_FAIL',
+                detalle: bloquear
+                    ? `Cuenta bloqueada por 15 minutos tras ${nuevosIntentos} intentos fallidos`
+                    : `Contraseña incorrecta (intento ${nuevosIntentos} de 5)`,
+                req,
+                exitoso: false
+            });
+
+            if (bloquear) {
+                return res.status(429).json({
+                    status: 'error',
+                    message: 'Ha superado los 5 intentos fallidos. Su cuenta ha sido bloqueada preventivamente por 15 minutos.'
+                });
+            }
+            return res.status(401).json({ status: 'error', message: 'Usuario o contraseña incorrectos' });
+        }
+
+        recordLoginIpResult(req, true);
+        await pool
+            .request()
+            .input('User', sql.NVarChar, dbUser.Usuario)
+            .query(`
+                UPDATE LIC_USUARIO
+                SET IntentosFallidos = 0,
+                    BloqueadoHasta = NULL,
+                    UltimoAcceso = GETDATE()
+                WHERE LOWER(LTRIM(RTRIM(Usuario))) = LOWER(@User)
+            `);
+
+        invalidateUserCache(dbUser.Usuario);
+
+        const tipoCode = String(dbUser.Tipo || (['admin', 'master'].includes(dbUser.Usuario.toLowerCase()) ? 'A' : 'O')).trim().toUpperCase();
+        const roleLabel = tipoCode === 'A' ? 'Administrador' : tipoCode === 'U' ? 'Consulta' : 'Operador Archivo';
+
+        const userPayload = {
+            username: dbUser.Usuario,
+            nombre: dbUser.nombreUsuario || dbUser.Usuario,
+            tipo: tipoCode,
+            role: roleLabel,
+            unidad: dbUser.Unidad || 'cmds',
+            debeCambiarClave: Number(dbUser.DebeCambiarClave) === 1
+        };
+
+        const token = jwt.sign(userPayload, JWT_SECRET, { expiresIn: '12h' });
+
+        await registrarAuditoriaAcceso(pool, {
+            usuario: dbUser.Usuario,
+            evento: 'LOGIN_OK',
+            detalle: `Inicio de sesión exitoso (Rol: ${roleLabel})`,
+            req,
+            exitoso: true
+        });
+
+        return res.json({ status: 'ok', token, user: userPayload });
     } catch (error) {
         console.error('Error en login:', error);
         res.status(500).json({ status: 'error', message: 'Error interno del servidor al autenticar' });
     }
 });
+
+// Protección global JWT para todas las rutas /api/* posteriores
+app.use('/api', authenticateJWT);
+
+app.get('/api/auth/me', (req, res) => {
+    res.json({ status: 'ok', user: req.user });
+});
+
+app.post('/api/auth/change-password', async (req, res) => {
+    try {
+        const { passwordActual, passwordNueva } = req.body;
+        const pActual = cleanStr(passwordActual);
+        const pNueva = cleanStr(passwordNueva);
+
+        if (!pActual || !pNueva) {
+            return res.status(400).json({ status: 'error', message: 'Debe ingresar su contraseña actual y la nueva contraseña.' });
+        }
+        if (pNueva.length < 6) {
+            return res.status(400).json({ status: 'error', message: 'La nueva contraseña debe tener al menos 6 caracteres.' });
+        }
+        if (pActual === pNueva) {
+            return res.status(400).json({ status: 'error', message: 'La nueva contraseña debe ser distinta a la actual.' });
+        }
+
+        const pool = await poolPromise;
+        const dbRes = await pool
+            .request()
+            .input('u', sql.NVarChar, req.user.username)
+            .query(`
+                SELECT
+                    LTRIM(RTRIM(Usuario)) AS Usuario,
+                    LTRIM(RTRIM(ISNULL(Password, ''))) AS Clave,
+                    LTRIM(RTRIM(ISNULL(PasswordHash, ''))) AS PasswordHash
+                FROM LIC_USUARIO
+                WHERE LOWER(LTRIM(RTRIM(Usuario))) = LOWER(@u)
+            `);
+
+        if (!dbRes.recordset || dbRes.recordset.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'Usuario no encontrado.' });
+        }
+
+        const uRow = dbRes.recordset[0];
+        let actualOk = false;
+        if (uRow.PasswordHash && uRow.PasswordHash.startsWith('$2')) {
+            actualOk = await bcrypt.compare(pActual, uRow.PasswordHash);
+        }
+        if (!actualOk && uRow.Clave && uRow.Clave === pActual) {
+            actualOk = true;
+        }
+
+        if (!actualOk) {
+            await registrarAuditoriaAcceso(pool, {
+                usuario: req.user.username,
+                evento: 'PASSWORD_CHANGE_FAIL',
+                detalle: 'Intento de cambio de contraseña con clave actual incorrecta',
+                req,
+                exitoso: false
+            });
+            return res.status(401).json({ status: 'error', message: 'La contraseña actual ingresada no es correcta.' });
+        }
+
+        const nuevoHash = await bcrypt.hash(pNueva, BCRYPT_ROUNDS);
+        const claveLegada = pNueva.slice(0, 10);
+
+        await pool
+            .request()
+            .input('Clave', sql.NVarChar, claveLegada)
+            .input('PasswordHash', sql.NVarChar, nuevoHash)
+            .input('User', sql.NVarChar, uRow.Usuario)
+            .query(`
+                UPDATE LIC_USUARIO
+                SET Password = @Clave,
+                    PasswordHash = @PasswordHash,
+                    DebeCambiarClave = 0,
+                    UltimoCambioClave = GETDATE()
+                WHERE LOWER(LTRIM(RTRIM(Usuario))) = LOWER(@User)
+            `);
+
+        invalidateUserCache(uRow.Usuario);
+        await registrarAuditoriaAcceso(pool, {
+            usuario: uRow.Usuario,
+            evento: 'PASSWORD_CHANGE',
+            detalle: 'El usuario actualizó su contraseña personal',
+            req,
+            exitoso: true
+        });
+
+        res.json({ status: 'ok', message: 'Su contraseña ha sido actualizada exitosamente.' });
+    } catch (err) {
+        console.error('Error en POST /api/auth/change-password (Archivo):', err);
+        res.status(500).json({ status: 'error', message: 'Error al cambiar la contraseña.' });
+    }
+});
+
+app.use('/api/usuarios', async (req, res, next) => {
+    try {
+        req.db = await poolPromise;
+        next();
+    } catch {
+        res.status(500).json({ error: 'DB connection error' });
+    }
+}, require('./routes/usuarios'));
 
 // ============================================================================
 // 2. DOMINIOS Y LISTAS DESPLEGABLES

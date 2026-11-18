@@ -6,6 +6,7 @@ import Inicio from './pages/Inicio';
 import MantencionExpedientes from './pages/MantencionExpedientes';
 import MantencionComprobantes from './pages/MantencionComprobantes';
 import InformesArchivo from './pages/InformesArchivo';
+import MantencionUsuarios from './pages/MantencionUsuarios';
 
 function App() {
   const [token, setToken] = useState<string | null>(localStorage.getItem('auth_token'));
@@ -67,6 +68,7 @@ function App() {
           <Route path="/informes/bitacora-comprobante" element={<InformesArchivo tabInicial="bitacora-comprobante" />} />
           <Route path="/informes/nomina-comprobantes" element={<InformesArchivo tabInicial="nomina-comprobantes" />} />
           <Route path="/informes/pendientes" element={<InformesArchivo tabInicial="pendientes" />} />
+          <Route path="/mantencion/usuarios" element={<MantencionUsuarios />} />
 
           <Route path="*" element={<Navigate to="/inicio" replace />} />
         </Routes>
